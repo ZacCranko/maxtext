@@ -23,7 +23,6 @@ from aqt.jax.v2 import aqt_dq_dot_general as aqt_dq
 from aqt.jax.v2.google import aqt_config
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh
-from jax.sharding import PartitionSpec as P
 
 import functools
 import operator
@@ -40,8 +39,7 @@ from jax import lax
 from jax import random
 from jax.ad_checkpoint import checkpoint_name
 import jax.numpy as jnp
-if jax.__version__ >= '0.4.16':
-  from jax.experimental.pallas.ops.tpu import flash_attention
+from jax.experimental.pallas.ops.tpu import flash_attention
 
 
 
@@ -332,36 +330,42 @@ class MultiHeadDotProductAttention(nn.Module):
     """ Apply Attention
     """
     if enable_flash_attention:
+      query = LayerNorm(dtype=self.dtype, name='query_layer_norm', kernel_axes = ('heads',))(query)
+      key = LayerNorm(dtype=self.dtype, name='key_layer_norm', kernel_axes = ('heads',))(key)
       # reshaped to ('batch', 'heads', 'length', 'kv')
       query = jax.numpy.transpose(query, axes = (0,2,1,3))
       key = jax.numpy.transpose(key, axes = (0,2,1,3))
       value = jax.numpy.transpose(value, axes = (0,2,1,3))
+      axis_names = nn.logical_to_mesh_axes(('activation_batch', 'activation_heads', 'activation_length', 'activation_kv'))
       @functools.partial(shard_map, mesh = self.mesh, in_specs = (
-          P(('data','fsdp'),'tensor'),
-          P(('data','fsdp'),'tensor'),
-          P(('data','fsdp'),'tensor'),
-      ), out_specs = P(('data','fsdp'),'tensor'), check_rep=False)
-      def wrap_flash_attention(query, key, value):
+          axis_names,
+          axis_names,
+          axis_names,
+          axis_names,
+      ), out_specs = axis_names, check_rep=False)
+      def wrap_flash_attention(query, key, value, attention_bias):
         return flash_attention.flash_attention(
               query,
               key,
               value,
-              causal = False,
+              causal = True,
+              ab = attention_bias,
               block_sizes = flash_attention.BlockSizes(
-                  block_q=512,
-                  block_k_major=512,
-                  block_k=512,
-                  block_b=1,
-                  block_q_major_dkv=512,
-                  block_k_major_dkv=512,
-                  block_k_dkv=512,
-                  block_q_dkv=512,
-                  block_k_major_dq=512,
-                  block_k_dq=512,
-                  block_q_dq=512,
+                block_q=512,
+                block_k_major=512,
+                block_k=512,
+                block_b=2,
+                block_q_major_dkv=512,
+                block_k_major_dkv=512,
+                block_q_dkv=512,
+                block_k_dkv=512,
+                block_q_dq=1024,
+                block_k_dq=256,
+                block_k_major_dq=512,
+
               )
             )
-      x = wrap_flash_attention(query, key, value)
+      x = wrap_flash_attention(query, key, value, attention_bias)
       x = jax.numpy.transpose(x, axes = (0,2,1,3))
     else:
       aqt_rng = self.make_rng('aqt')
@@ -541,6 +545,9 @@ class MultiHeadDotProductAttention(nn.Module):
 
     # Apply attention.
     x = self.apply_attention(query, key, value, cfg.enable_flash_attention, attention_bias, dropout_rng, deterministic)
+    x = nn.with_logical_constraint(
+        x, ('activation_batch', 'activation_length', 'activation_heads', 'activation_kv')
+    )
 
     # Back to the original inputs dimensions.
     out = DenseGeneral(
