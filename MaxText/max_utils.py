@@ -162,16 +162,6 @@ def to_int8(t):
     return jax.tree_map(lambda x:x.astype(jnp.int8) if x.dtype == jnp.float32 else x, t)
 
 
-def init_inference_state(apply_):
-  state = train_state.TrainState(
-    step=0,
-    apply_fn=model.apply,
-    params=(to_int8(model_vars['params']) if config.convert_int8 else model_vars['params']),
-    tx=None,
-    opt_state={}
-    )
-  return state
-
 def init_train_state(model, tx, config, store_opt_state, key):
   """
   We pass in "static" objects like model, tx, config as JAX compares them by
@@ -199,7 +189,7 @@ def init_train_state(model, tx, config, store_opt_state, key):
       step=0,
       apply_fn=model.apply,
       params=to_int8(model_vars['params']) if config.convert_int8 else model_vars['params'],
-      tx=None,
+      tx=tx,
       opt_state={}
     )
 
@@ -252,7 +242,7 @@ def setup_initial_state(model, tx, config, rng, mesh, checkpoint_manager, store_
         if raw_params: # If we loaded a partial state, we need to merge it.
           state = state.replace(params = raw_params)
       else:
-        state = train_state.TrainState(step=0, params=raw_params, apply_fn=None, tx=tx, opt_state={})
+        state = train_state.TrainState(step=0, params=raw_params, apply_fn=model.apply, tx=tx, opt_state={})
     raw_params = None
 
   state = unbox_logicallypartioned_trainstate(state)
